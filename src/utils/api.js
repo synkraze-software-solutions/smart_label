@@ -1,4 +1,5 @@
 import { supabase } from './supabaseClient';
+import { nextInvoiceNumber } from './invoiceNumbers';
 
 // Clients (Stores) API
 export const getClientsAsync = async () => {
@@ -30,6 +31,32 @@ export const getClientsAsync = async () => {
     offerText: client.offer_text,
     createdAt: client.created_at
   }));
+};
+
+// Public scan pages need only one store and the fields shown to customers.
+// Database RLS must also enforce this boundary; a narrow query alone does
+// not protect the table from a direct API request.
+export const getPublicClientAsync = async (clientId) => {
+  const { data, error } = await supabase
+    .from('store_clients')
+    .select('id, name, location_url, instagram, whatsapp, facebook, website, qr_type, reward_code, logo_data, offer_text')
+    .eq('id', clientId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) return null;
+  return {
+    id: data.id,
+    name: data.name,
+    locationUrl: data.location_url,
+    instagram: data.instagram,
+    whatsapp: data.whatsapp,
+    facebook: data.facebook,
+    website: data.website,
+    qrType: data.qr_type,
+    rewardCode: data.reward_code,
+    logoData: data.logo_data,
+    offerText: data.offer_text
+  };
 };
 
 export const saveClientAsync = async (client) => {
@@ -91,6 +118,25 @@ export const saveClientAsync = async (client) => {
 };
 
 export const deleteClientAsync = async (id) => {
+  // A printed/distributed QR must never lose its store page through the UI.
+  const { count, error: runsError } = await supabase
+    .from('print_runs')
+    .select('id', { count: 'exact', head: true })
+    .eq('client_id', id);
+  if (runsError) {
+    console.error('Could not check store QR batches:', runsError);
+    return { success: false, reason: 'check_failed' };
+  }
+  if (count > 0) return { success: false, reason: 'has_qrs' };
+
+  const { data: client, error: clientError } = await supabase
+    .from('store_clients')
+    .select('stickers_printed')
+    .eq('id', id)
+    .maybeSingle();
+  if (clientError || !client) return { success: false, reason: 'check_failed' };
+  if (Number(client.stickers_printed) > 0) return { success: false, reason: 'has_qrs' };
+
   const { error } = await supabase
     .from('store_clients')
     .delete()
@@ -98,9 +144,9 @@ export const deleteClientAsync = async (id) => {
     
   if (error) {
     console.error('Error deleting client:', error);
-    return false;
+    return { success: false, reason: 'delete_failed' };
   }
-  return true;
+  return { success: true };
 };
 
 // Print Runs and QR Codes API
@@ -122,9 +168,8 @@ export const savePrintRunAsync = async (clientId, quantity, winnersCount, qrCode
   
   const runId = runData[0].id;
   
-  // 2. Prepare ONLY winning QR Codes for bulk insert
-  const winningQRs = qrCodesList.filter(qr => qr.isWinner);
-  const qrPayloads = winningQRs.map(qr => ({
+  // Save every QR so losing stickers can also be recognized after one reveal.
+  const qrPayloads = qrCodesList.map(qr => ({
     id: qr.uuid, // Use the pre-generated UUID from the frontend
     client_id: clientId,
     print_run_id: runId,
@@ -134,7 +179,7 @@ export const savePrintRunAsync = async (clientId, quantity, winnersCount, qrCode
     sticker_number: qr.stickerNumber
   }));
   
-  // 3. Insert Winning QR Codes (if any)
+  // 3. Insert every QR in the batch.
   if (qrPayloads.length > 0) {
     const { error: qrError } = await supabase
       .from('qr_codes')
@@ -142,6 +187,13 @@ export const savePrintRunAsync = async (clientId, quantity, winnersCount, qrCode
       
     if (qrError) {
       console.error('Error saving QR codes:', qrError);
+      // A failed batch must never be printed as though its QRs were active.
+      const { error: rollbackError } = await supabase
+        .from('print_runs')
+        .delete()
+        .eq('id', runId);
+      if (rollbackError) console.error('Error rolling back print run:', rollbackError);
+      return null;
     }
   }
   
@@ -167,24 +219,24 @@ export const logPrintRunAsync = async (clientId, quantity) => {
 export const getQRCodeDetailsAsync = async (qrId) => {
   const { data, error } = await supabase
     .from('qr_codes')
-    .select('*, store_clients(name)')
+    .select('id, client_id, is_winner, is_claimed, coupon_code')
     .eq('id', qrId)
     .single();
     
-  if (error || !data) {
-    console.error('Error fetching QR details:', error);
+  if (error?.code === 'PGRST116' || !data && !error) {
     return null;
+  }
+  if (error) {
+    console.error('Error fetching QR details:', error);
+    throw error;
   }
   
   return {
     id: data.id,
     clientId: data.client_id,
-    storeName: data.store_clients?.name,
     isWinner: data.is_winner,
     isClaimed: data.is_claimed,
-    couponCode: data.coupon_code,
-    claimerName: data.claimer_name,
-    claimerPhone: data.claimer_phone
+    couponCode: data.coupon_code
   };
 };
 
@@ -198,16 +250,25 @@ export const claimQRCodeAsync = async (qrId, claimerName, claimerPhone) => {
       scanned_at: new Date().toISOString()
     })
     .eq('id', qrId)
-    .select();
+    .eq('is_claimed', false)
+    .select('id');
     
   if (error) {
     console.error('Error claiming QR code:', error);
     return false;
   }
-  return true;
+  return data?.length === 1;
 };
 
 // --- Invoices API ---
+export const getNextInvoiceNumberAsync = async () => {
+  const { data, error } = await supabase
+    .from('invoices')
+    .select('invoice_number');
+  if (error) throw error;
+  return nextInvoiceNumber(data.map(invoice => invoice.invoice_number));
+};
+
 export const getInvoicesAsync = async () => {
   const { data, error } = await supabase
     .from('invoices')

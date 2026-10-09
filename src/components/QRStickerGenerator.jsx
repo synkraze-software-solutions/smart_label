@@ -3,6 +3,7 @@ import QRCode from 'qrcode';
 import QRCodeStyling from 'qr-code-styling';
 import { QrCode, Printer, Sliders, RefreshCw, Download, Layers } from 'lucide-react';
 import { savePrintRunAsync, logPrintRunAsync } from '../utils/api';
+import { createVendorCsv } from '../utils/vendorExport';
 
 export default function QRStickerGenerator({ client, config, onConfigChange }) {
   const [targetBaseUrl, setTargetBaseUrl] = useState(
@@ -17,6 +18,7 @@ export default function QRStickerGenerator({ client, config, onConfigChange }) {
   const [isGenerating, setIsGenerating] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [hasSavedRun, setHasSavedRun] = useState(false);
+  const [runId, setRunId] = useState(null);
   const isGeneratingRef = useRef(false);
   const [printLayoutMode, setPrintLayoutMode] = useState(false);
 
@@ -33,6 +35,8 @@ export default function QRStickerGenerator({ client, config, onConfigChange }) {
     if (client) {
       setWinnersCount(prev => Math.min(quantity, client.rewardCount || 1));
       setQrCodes([]); // Clear previous QRs so they must generate explicitly for the new client
+      setHasSavedRun(false);
+      setRunId(null);
     }
   }, [client, quantity]);
 
@@ -74,6 +78,8 @@ export default function QRStickerGenerator({ client, config, onConfigChange }) {
     if (!client || isGeneratingRef.current) return;
     isGeneratingRef.current = true;
     setIsGenerating(true);
+    setHasSavedRun(false);
+    setRunId(null);
     const codes = [];
 
     // Base URL structure: [TargetUrl]?store=[clientId]
@@ -166,15 +172,24 @@ export default function QRStickerGenerator({ client, config, onConfigChange }) {
       }
     }
 
-    setQrCodes(codes);
-    
-    // Save to DB immediately so user can test scanning from screen before printing
-    const actualWinners = codes.filter(c => c.isWinner).length;
-    await savePrintRunAsync(client.id, codes.length, actualWinners, codes);
-    setHasSavedRun(true);
-
-    setIsGenerating(false);
-    isGeneratingRef.current = false;
+    try {
+      if (codes.length !== quantity) {
+        throw new Error('Some QR images could not be generated. No sheet was saved.');
+      }
+      // A sheet is printable only after every QR has been saved successfully.
+      const actualWinners = codes.filter(c => c.isWinner).length;
+      const runId = await savePrintRunAsync(client.id, codes.length, actualWinners, codes);
+      if (!runId) throw new Error('The QR batch could not be saved. Please try again.');
+      setQrCodes(codes);
+      setRunId(runId);
+      setHasSavedRun(true);
+    } catch (error) {
+      setQrCodes([]);
+      alert(error.message);
+    } finally {
+      setIsGenerating(false);
+      isGeneratingRef.current = false;
+    }
   };
 
 
@@ -190,10 +205,25 @@ export default function QRStickerGenerator({ client, config, onConfigChange }) {
 
   const handlePrint = async () => {
     // Only log analytics when they actually print
+    if (!hasSavedRun || qrCodes.length === 0) return;
     if (qrCodes.length > 0) {
       await logPrintRunAsync(client.id, qrCodes.length);
     }
     window.print();
+  };
+
+  const downloadVendorCsv = () => {
+    if (!hasSavedRun || !runId || qrCodes.length === 0) return;
+    const csv = createVendorCsv({ runId, clientName: client.name, promoText: stickerText, codes: qrCodes });
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `qr-labels-${runId}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
   };
 
   return (
@@ -250,6 +280,9 @@ export default function QRStickerGenerator({ client, config, onConfigChange }) {
 
           <div className="cal-col">
             <h4>Sticker Size (mm)</h4>
+            <button type="button" className="btn btn-outline btn-sm" onClick={() => setMargins(current => ({ ...current, width: 50, height: 30 }))}>
+              Use supplier 50 × 30 mm size
+            </button>
             <div className="cal-input-row">
               <div className="cal-input-group">
                 <label>Width</label>
@@ -448,7 +481,10 @@ export default function QRStickerGenerator({ client, config, onConfigChange }) {
             <button className="btn btn-secondary btn-icon" onClick={generateQRs} disabled={isGenerating || isSaving}>
               <RefreshCw size={16} className={isGenerating ? 'spin' : ''} /> Generate QR Codes
             </button>
-            <button className="btn btn-primary btn-icon" onClick={handlePrint} disabled={qrCodes.length === 0 || isSaving}>
+            <button className="btn btn-secondary btn-icon" onClick={downloadVendorCsv} disabled={!hasSavedRun || qrCodes.length === 0}>
+              <Download size={16} /> Download Vendor CSV (50×30 mm)
+            </button>
+            <button className="btn btn-primary btn-icon" onClick={handlePrint} disabled={!hasSavedRun || qrCodes.length === 0 || isSaving}>
               <Printer size={16} /> {isSaving ? 'Saving...' : 'Print & Save Sheet (Ctrl+P)'}
             </button>
           </div>

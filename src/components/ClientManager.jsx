@@ -137,11 +137,13 @@ export default function ClientManager({ clients, onSaveClients, onSelectClient, 
 
   const handleDelete = async (id) => {
     if (window.confirm('Are you sure you want to delete this store profile?')) {
-      const success = await deleteClientAsync(id);
-      if (success) {
+      const result = await deleteClientAsync(id);
+      if (result.success) {
         onSaveClients(clients.filter(c => c.id !== id));
+      } else if (result.reason === 'has_qrs') {
+        alert('This store has QR batches. Deleting it would break stickers already in circulation, so it cannot be deleted.');
       } else {
-        alert("Failed to delete client from database.");
+        alert('Could not safely delete this store. Please try again later.');
       }
     }
   };
@@ -370,7 +372,7 @@ export default function ClientManager({ clients, onSaveClients, onSelectClient, 
                       <span className={`badge ${client.qrType === 'simple' ? 'badge-blue' : 'badge-purple'}`}>
                         {client.qrType === 'simple' ? 'Type 1: Simple QR' : 'Type 2: Advanced Coupon QR'}
                       </span>
-                      <span className="badge badge-gray">Registered: {client.createdDate}</span>
+                      <span className="badge badge-gray">Registered: {client.createdAt ? new Date(client.createdAt).toLocaleDateString('en-IN') : '—'}</span>
                     </div>
                   </div>
 
